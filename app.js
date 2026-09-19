@@ -90,46 +90,103 @@ async function handleImage(blob) {
     return;
   }
 
-  let codes;
   try {
-    const found = await readBarcodes(blob, {
-      formats: ["QRCode"],
-      tryHarder: true,
-      maxNumberOfSymbols: 255,
-    });
-    codes = dedupe(found.filter((c) => c.isValid && c.text));
+    await scan(blob, id);
   } catch (err) {
     console.error(err);
     if (id !== runId) return;
     showStatus("Something went wrong while scanning the image.", true);
-    return;
   }
-  if (id !== runId) return; // a newer image replaced this one
+}
 
-  // Number codes in reading order: top-to-bottom, then left-to-right.
-  codes.sort((a, b) => {
+// Passes are tried in order, from cheapest to most expensive, and their results
+// are merged. Codes that a plain scan misses — photos of stylized codes with
+// round dots or a logo, low contrast, small codes — usually need an upscale and
+// a different binarizer, so the later passes supply those.
+const PASSES = [
+  { scale: 1, binarizer: "LocalAverage" },
+  { scale: 1, binarizer: "FixedThreshold" },
+  { scale: 2, binarizer: "LocalAverage" },
+  { scale: 2, binarizer: "FixedThreshold" },
+  { scale: 3, binarizer: "FixedThreshold" },
+  { scale: 3, binarizer: "GlobalHistogram" },
+];
+// Keeps an upscaled canvas from blowing up memory on big screenshots.
+const MAX_PIXELS = 6e6;
+
+async function scan(blob, id) {
+  const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const found = new Map();
+  let done = 0;
+
+  for (const pass of PASSES) {
+    const scale = Math.min(pass.scale, Math.sqrt(MAX_PIXELS / (bitmap.width * bitmap.height)));
+    if (scale < pass.scale && scale <= 1 && pass.scale > 1) continue; // no room to upscale
+
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    const results = await readBarcodes(ctx.getImageData(0, 0, canvas.width, canvas.height), {
+      formats: ["QRCode"],
+      tryHarder: true,
+      maxNumberOfSymbols: 255,
+      binarizer: pass.binarizer,
+    });
+    if (id !== runId) return; // a newer image replaced this one
+    done++;
+
+    const before = found.size;
+    for (const code of results) {
+      if (!code.isValid || !code.text) continue;
+      const scaled = rescale(code, scale);
+      const b = bounds(scaled);
+      const key = `${code.text}|${Math.round(b.minX / 20)}|${Math.round(b.minY / 20)}`;
+      if (!found.has(key)) found.set(key, scaled);
+    }
+
+    if (found.size !== before) render(sortCodes([...found.values()]));
+    showStatus(
+      found.size
+        ? `Found ${found.size} QR code${found.size === 1 ? "" : "s"}.` +
+            (done < PASSES.length ? " Still looking…" : "")
+        : "Scanning harder…"
+    );
+    await nextFrame(); // let the page paint between passes
+    if (id !== runId) return;
+  }
+
+  bitmap.close();
+  if (!found.size) showStatus("No readable QR codes found.");
+  else showStatus(`Found ${found.size} QR code${found.size === 1 ? "" : "s"}.`);
+}
+
+// Map corner points from the upscaled canvas back to the image's own pixels.
+function rescale(code, scale) {
+  if (scale === 1) return code;
+  const p = code.position;
+  const div = (pt) => ({ x: pt.x / scale, y: pt.y / scale });
+  return {
+    ...code,
+    position: {
+      topLeft: div(p.topLeft), topRight: div(p.topRight),
+      bottomRight: div(p.bottomRight), bottomLeft: div(p.bottomLeft),
+    },
+  };
+}
+
+// Number codes in reading order: top-to-bottom, then left-to-right.
+function sortCodes(codes) {
+  return codes.sort((a, b) => {
     const ba = bounds(a), bb = bounds(b);
     return Math.abs(ba.minY - bb.minY) > 20 ? ba.minY - bb.minY : ba.minX - bb.minX;
   });
-
-  render(codes);
-  showStatus(
-    codes.length === 0
-      ? "No readable QR codes found."
-      : `Found ${codes.length} QR code${codes.length === 1 ? "" : "s"}.`
-  );
 }
 
-function dedupe(codes) {
-  const seen = new Set();
-  return codes.filter((c) => {
-    const b = bounds(c);
-    const key = `${c.text}|${Math.round(b.minX / 10)}|${Math.round(b.minY / 10)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
 
 function corners(code) {
   const p = code.position;
@@ -154,6 +211,7 @@ function clearResults() {
 }
 
 function render(codes) {
+  clearResults();
   const w = img.naturalWidth, h = img.naturalHeight;
   outlines.setAttribute("viewBox", `0 0 ${w} ${h}`);
   outlines.setAttribute("preserveAspectRatio", "none");
@@ -182,18 +240,37 @@ function render(codes) {
 }
 
 // Center each label under its code without letting it spill past the image
-// edges. On narrow screens, show only the number badge; the list has the text.
-const COMPACT_BELOW = 560;
+// edges. Labels keep their text unless there isn't room — too narrow, or codes
+// packed close enough that the labels would overlap — in which case they shrink
+// to just their number and the full text stays in the list below.
+const MIN_PILL_WIDTH = 220;
 function layoutLabels() {
   const width = labels.clientWidth;
   if (!width) return;
-  labels.classList.toggle("compact", width < COMPACT_BELOW);
-  for (const label of labels.children) {
-    const lw = label.offsetWidth;
-    const left = Number(label.dataset.cx) * width - lw / 2;
-    label.style.left = `${clamp(left, 0, Math.max(0, width - lw))}px`;
+
+  labels.classList.remove("compact");
+  let place = () => {
+    for (const label of labels.children) {
+      const lw = label.offsetWidth;
+      const left = Number(label.dataset.cx) * width - lw / 2;
+      label.style.left = `${clamp(left, 0, Math.max(0, width - lw))}px`;
+    }
+  };
+  place();
+
+  if (width < MIN_PILL_WIDTH || labelsOverlap()) {
+    labels.classList.add("compact");
+    place();
   }
 }
+
+function labelsOverlap() {
+  const rects = [...labels.children].map((l) => l.getBoundingClientRect());
+  return rects.some((a, i) =>
+    rects.some((b, j) => j > i && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom)
+  );
+}
+
 new ResizeObserver(layoutLabels).observe(labels);
 
 function makePill(text, link, n) {
