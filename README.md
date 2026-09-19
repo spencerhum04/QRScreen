@@ -8,13 +8,5 @@ Ways to load an image:
 - drag and drop an image file onto the page
 - paste an image from the clipboard (e.g. take a screenshot with ⌘⇧⌃4, then press ⌘V)
 
-## Run
-It's a static site with no build step. It has to be served over HTTP, because ES modules and WebAssembly won't load from `file://`:
-
-```sh
-python3 -m http.server 8000
-```
-
-Then open http://localhost:8000.
-
-Decoding uses [zxing-wasm](https://github.com/Sec-ant/zxing-wasm), loaded from jsDelivr, so the first load needs internet access.
+## Usage
+Live at https://qrscreen-eight.vercel.app/
