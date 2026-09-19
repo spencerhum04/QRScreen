@@ -99,13 +99,27 @@ async function handleImage(blob) {
   }
 }
 
+// The browser's own detector, where it exists. On macOS and Android it is the
+// system scanner — the same engine the phone camera uses — and it reads blurry,
+// angled photos that zxing can't. Safari and Firefox don't have it, so zxing
+// stays as the fallback and both engines' results are merged.
+const native = (() => {
+  try {
+    return "BarcodeDetector" in window ? new BarcodeDetector({ formats: ["qr_code"] }) : null;
+  } catch {
+    return null; // constructor throws when qr_code isn't supported
+  }
+})();
+
 // Passes are tried in order, from cheapest to most expensive, and their results
 // are merged. Codes that a plain scan misses — photos of stylized codes with
 // round dots or a logo, low contrast, small codes — usually need an upscale and
 // a different binarizer, so the later passes supply those.
 const PASSES = [
+  { scale: 1, engine: "native" },
   { scale: 1, binarizer: "LocalAverage" },
   { scale: 1, binarizer: "FixedThreshold" },
+  { scale: 2, engine: "native" },
   { scale: 2, binarizer: "LocalAverage" },
   { scale: 2, binarizer: "FixedThreshold" },
   { scale: 3, binarizer: "FixedThreshold" },
@@ -119,23 +133,31 @@ async function scan(blob, id) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const found = new Map();
+  const passes = PASSES.filter((p) => p.engine !== "native" || native);
   let done = 0;
 
-  for (const pass of PASSES) {
+  for (const pass of passes) {
     const scale = Math.min(pass.scale, Math.sqrt(MAX_PIXELS / (bitmap.width * bitmap.height)));
     if (scale < pass.scale && scale <= 1 && pass.scale > 1) continue; // no room to upscale
 
-    canvas.width = Math.round(bitmap.width * scale);
-    canvas.height = Math.round(bitmap.height * scale);
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    let source = bitmap;
+    if (scale !== 1 || pass.engine !== "native") {
+      canvas.width = Math.round(bitmap.width * scale);
+      canvas.height = Math.round(bitmap.height * scale);
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      source = canvas;
+    }
 
-    const results = await readBarcodes(ctx.getImageData(0, 0, canvas.width, canvas.height), {
-      formats: ["QRCode"],
-      tryHarder: true,
-      maxNumberOfSymbols: 255,
-      binarizer: pass.binarizer,
-    });
+    const results =
+      pass.engine === "native"
+        ? await detectNative(source)
+        : await readBarcodes(ctx.getImageData(0, 0, canvas.width, canvas.height), {
+            formats: ["QRCode"],
+            tryHarder: true,
+            maxNumberOfSymbols: 255,
+            binarizer: pass.binarizer,
+          });
     if (id !== runId) return; // a newer image replaced this one
     done++;
 
@@ -152,7 +174,7 @@ async function scan(blob, id) {
     showStatus(
       found.size
         ? `Found ${found.size} QR code${found.size === 1 ? "" : "s"}.` +
-            (done < PASSES.length ? " Still looking…" : "")
+            (done < passes.length ? " Still looking…" : "")
         : "Scanning harder…"
     );
     await nextFrame(); // let the page paint between passes
@@ -162,6 +184,27 @@ async function scan(blob, id) {
   bitmap.close();
   if (!found.size) showStatus("No readable QR codes found.");
   else showStatus(`Found ${found.size} QR code${found.size === 1 ? "" : "s"}.`);
+}
+
+// Run the browser's detector and reshape its output to match zxing's, so both
+// engines' results can be merged and drawn the same way.
+async function detectNative(source) {
+  let detected;
+  try {
+    detected = await native.detect(source);
+  } catch {
+    return []; // some inputs it refuses; the zxing passes still run
+  }
+  return detected
+    .filter((d) => d.rawValue)
+    .map((d) => {
+      const [a, b, c, e] = d.cornerPoints; // clockwise from the top-left
+      return {
+        isValid: true,
+        text: d.rawValue,
+        position: { topLeft: a, topRight: b, bottomRight: c, bottomLeft: e },
+      };
+    });
 }
 
 // Map corner points from the upscaled canvas back to the image's own pixels.
